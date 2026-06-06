@@ -67,9 +67,21 @@ function initSqlite() {
     )
   `).run();
 
+  sqliteDb.prepare(`
+    CREATE TABLE IF NOT EXISTS price_history (
+      history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lot_id TEXT,
+      price REAL,
+      bid_count INTEGER,
+      timestamp TEXT,
+      FOREIGN KEY(lot_id) REFERENCES lots(id)
+    )
+  `).run();
+
   // Create indexes for fast querying
   sqliteDb.prepare(`CREATE INDEX IF NOT EXISTS idx_lots_lot_number ON lots (lot_number)`).run();
   sqliteDb.prepare(`CREATE INDEX IF NOT EXISTS idx_lots_is_active ON lots (is_active)`).run();
+  sqliteDb.prepare(`CREATE INDEX IF NOT EXISTS idx_price_history_lot_id ON price_history (lot_id)`).run();
 
   dbType = 'sqlite';
   console.log(`SQLite initialized successfully at ${dbPath}`);
@@ -89,89 +101,176 @@ async function saveLot(lot, isFullSync = true) {
 
   if (dbType === 'firestore') {
     const docRef = firestoreDb.collection('lots').doc(lot.id);
-    
-    if (isFullSync) {
-      // Full sync: write all fields
-      await docRef.set({
-        id: lot.id,
-        lotNumber: lot.lotNumber || null,
-        title: lot.title || null,
-        description: lot.description || null,
-        currentPrice: lot.currentPrice !== undefined ? lot.currentPrice : null,
-        minBid: lot.minBid !== undefined ? lot.minBid : null,
-        bidCount: lot.bidCount !== undefined ? lot.bidCount : 0,
-        status: lot.status || 'Open',
-        endTime: lot.endTime || null,
-        images: lot.images || [],
-        url: lot.url || null,
-        lastUpdated: now,
-        isActive: lot.isActive !== undefined ? lot.isActive : true
-      }, { merge: true });
-    } else {
-      // Pricing-only update: only update mutable pricing/bidding fields
-      await docRef.set({
-        currentPrice: lot.currentPrice !== undefined ? lot.currentPrice : null,
-        minBid: lot.minBid !== undefined ? lot.minBid : null,
-        bidCount: lot.bidCount !== undefined ? lot.bidCount : 0,
-        status: lot.status || 'Open',
-        lastUpdated: now
-      }, { merge: true });
+    const docSnap = await docRef.get();
+    const exists = docSnap.exists;
+
+    let previousPrice = null;
+    let previousBidCount = null;
+    let previousStatus = null;
+
+    if (exists) {
+      const existingData = docSnap.data();
+      previousPrice = existingData.currentPrice;
+      previousBidCount = existingData.bidCount;
+      previousStatus = existingData.status;
+    }
+
+    const incomingPrice = lot.currentPrice !== undefined ? lot.currentPrice : null;
+    const incomingBidCount = lot.bidCount !== undefined ? lot.bidCount : 0;
+    const incomingStatus = lot.status || 'Open';
+
+    const priceChanged = incomingPrice !== previousPrice;
+    const bidCountChanged = incomingBidCount !== previousBidCount;
+    const statusChanged = incomingStatus !== previousStatus;
+
+    const hasHistoryChanged = !exists || priceChanged || bidCountChanged;
+    const shouldUpdateLot = isFullSync || !exists || priceChanged || bidCountChanged || statusChanged;
+
+    if (shouldUpdateLot || hasHistoryChanged) {
+      const batch = firestoreDb.batch();
+
+      if (shouldUpdateLot) {
+        if (isFullSync) {
+          batch.set(docRef, {
+            id: lot.id,
+            lotNumber: lot.lotNumber || null,
+            title: lot.title || null,
+            description: lot.description || null,
+            currentPrice: incomingPrice,
+            minBid: lot.minBid !== undefined ? lot.minBid : null,
+            bidCount: incomingBidCount,
+            status: incomingStatus,
+            endTime: lot.endTime || null,
+            images: lot.images || [],
+            url: lot.url || null,
+            lastUpdated: now,
+            isActive: lot.isActive !== undefined ? lot.isActive : true
+          }, { merge: true });
+        } else {
+          batch.set(docRef, {
+            currentPrice: incomingPrice,
+            minBid: lot.minBid !== undefined ? lot.minBid : null,
+            bidCount: incomingBidCount,
+            status: incomingStatus,
+            lastUpdated: now
+          }, { merge: true });
+        }
+      }
+
+      if (hasHistoryChanged) {
+        const historyRef = firestoreDb.collection('price_history').doc();
+        batch.set(historyRef, {
+          historyId: historyRef.id,
+          lotId: lot.id,
+          price: incomingPrice,
+          bidCount: incomingBidCount,
+          timestamp: now
+        });
+      }
+
+      await batch.commit();
+      if (hasHistoryChanged) {
+        console.log(`[Firestore] Added price history for lot ${lot.id}. Price: ${incomingPrice}, Bids: ${incomingBidCount}`);
+      }
     }
   } else {
     // SQLite mode
-    if (isFullSync) {
-      const stmt = sqliteDb.prepare(`
-        INSERT INTO lots (id, lot_number, title, description, current_price, min_bid, bid_count, status, end_time, images, url, last_updated, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          lot_number = excluded.lot_number,
-          title = excluded.title,
-          description = excluded.description,
-          current_price = excluded.current_price,
-          min_bid = excluded.min_bid,
-          bid_count = excluded.bid_count,
-          status = excluded.status,
-          end_time = excluded.end_time,
-          images = excluded.images,
-          url = excluded.url,
-          last_updated = excluded.last_updated,
-          is_active = excluded.is_active
-      `);
-      
-      stmt.run(
-        lot.id,
-        lot.lotNumber || null,
-        lot.title || null,
-        lot.description || null,
-        lot.currentPrice !== undefined ? lot.currentPrice : null,
-        lot.minBid !== undefined ? lot.minBid : null,
-        lot.bidCount !== undefined ? lot.bidCount : 0,
-        lot.status || 'Open',
-        lot.endTime || null,
-        JSON.stringify(lot.images || []),
-        lot.url || null,
-        now,
-        (lot.isActive !== false) ? 1 : 0
-      );
-    } else {
-      // Pricing-only sync
-      const stmt = sqliteDb.prepare(`
-        UPDATE lots SET
-          current_price = ?,
-          min_bid = ?,
-          bid_count = ?,
-          status = ?,
-          last_updated = ?
-        WHERE id = ?
-      `);
-      stmt.run(
-        lot.currentPrice !== undefined ? lot.currentPrice : null,
-        lot.minBid !== undefined ? lot.minBid : null,
-        lot.bidCount !== undefined ? lot.bidCount : 0,
-        lot.status || 'Open',
-        now,
-        lot.id
-      );
+    const existingRow = sqliteDb.prepare('SELECT current_price, bid_count, status FROM lots WHERE id = ?').get(lot.id);
+    const exists = !!existingRow;
+
+    let previousPrice = null;
+    let previousBidCount = null;
+    let previousStatus = null;
+
+    if (exists) {
+      previousPrice = existingRow.current_price;
+      previousBidCount = existingRow.bid_count;
+      previousStatus = existingRow.status;
+    }
+
+    const incomingPrice = lot.currentPrice !== undefined ? lot.currentPrice : null;
+    const incomingBidCount = lot.bidCount !== undefined ? lot.bidCount : 0;
+    const incomingStatus = lot.status || 'Open';
+
+    const priceChanged = incomingPrice !== previousPrice;
+    const bidCountChanged = incomingBidCount !== previousBidCount;
+    const statusChanged = incomingStatus !== previousStatus;
+
+    const hasHistoryChanged = !exists || priceChanged || bidCountChanged;
+    const shouldUpdateLot = isFullSync || !exists || priceChanged || bidCountChanged || statusChanged;
+
+    if (shouldUpdateLot || hasHistoryChanged) {
+      const runTransaction = sqliteDb.transaction(() => {
+        if (shouldUpdateLot) {
+          if (isFullSync) {
+            const stmt = sqliteDb.prepare(`
+              INSERT INTO lots (id, lot_number, title, description, current_price, min_bid, bid_count, status, end_time, images, url, last_updated, is_active)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET
+                lot_number = excluded.lot_number,
+                title = excluded.title,
+                description = excluded.description,
+                current_price = excluded.current_price,
+                min_bid = excluded.min_bid,
+                bid_count = excluded.bid_count,
+                status = excluded.status,
+                end_time = excluded.end_time,
+                images = excluded.images,
+                url = excluded.url,
+                last_updated = excluded.last_updated,
+                is_active = excluded.is_active
+            `);
+            
+            stmt.run(
+              lot.id,
+              lot.lotNumber || null,
+              lot.title || null,
+              lot.description || null,
+              incomingPrice,
+              lot.minBid !== undefined ? lot.minBid : null,
+              incomingBidCount,
+              incomingStatus,
+              lot.endTime || null,
+              JSON.stringify(lot.images || []),
+              lot.url || null,
+              now,
+              (lot.isActive !== false) ? 1 : 0
+            );
+          } else {
+            // Pricing-only sync
+            const stmt = sqliteDb.prepare(`
+              UPDATE lots SET
+                current_price = ?,
+                min_bid = ?,
+                bid_count = ?,
+                status = ?,
+                last_updated = ?
+              WHERE id = ?
+            `);
+            stmt.run(
+              incomingPrice,
+              lot.minBid !== undefined ? lot.minBid : null,
+              incomingBidCount,
+              incomingStatus,
+              now,
+              lot.id
+            );
+          }
+        }
+
+        if (hasHistoryChanged) {
+          const histStmt = sqliteDb.prepare(`
+            INSERT INTO price_history (lot_id, price, bid_count, timestamp)
+            VALUES (?, ?, ?, ?)
+          `);
+          histStmt.run(lot.id, incomingPrice, incomingBidCount, now);
+        }
+      });
+
+      runTransaction();
+      if (hasHistoryChanged) {
+        console.log(`[SQLite] Added price history for lot ${lot.id}. Price: ${incomingPrice}, Bids: ${incomingBidCount}`);
+      }
     }
   }
 }
@@ -191,9 +290,43 @@ async function getAllLots() {
   } else {
     const rows = sqliteDb.prepare('SELECT * FROM lots').all();
     return rows.map(row => ({
-      ...row,
+      id: row.id,
+      lotNumber: row.lot_number,
+      title: row.title,
+      description: row.description,
+      currentPrice: row.current_price,
+      minBid: row.min_bid,
+      bidCount: row.bid_count,
+      status: row.status,
+      endTime: row.end_time,
       images: row.images ? JSON.parse(row.images) : [],
+      url: row.url,
+      lastUpdated: row.last_updated,
       isActive: row.is_active === 1
+    }));
+  }
+}
+
+/**
+ * Gets all price history records in the database.
+ * @returns {Array} - Array of price history records.
+ */
+async function getPriceHistory() {
+  if (dbType === 'firestore') {
+    const snapshot = await firestoreDb.collection('price_history').get();
+    const history = [];
+    snapshot.forEach(doc => {
+      history.push(doc.data());
+    });
+    return history;
+  } else {
+    const rows = sqliteDb.prepare('SELECT * FROM price_history').all();
+    return rows.map(row => ({
+      historyId: row.history_id,
+      lotId: row.lot_id,
+      price: row.price,
+      bidCount: row.bid_count,
+      timestamp: row.timestamp
     }));
   }
 }
@@ -240,6 +373,7 @@ module.exports = {
   init,
   saveLot,
   getAllLots,
+  getPriceHistory,
   syncActiveStatus,
   getDbType: () => dbType,
   getSqliteDb: () => sqliteDb,

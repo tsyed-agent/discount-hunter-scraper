@@ -23,10 +23,10 @@ The application consists of a web scraper that fetches auction items (lots) from
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|--------------|--------|
-| 1 | Git & Firebase Init | Initialize Git, create GitHub repository via `gh` CLI, create `.gitignore`, configure `firebase.json`, `.firebaserc`, and `firestore.rules`. | None | PLANNED |
-| 2 | Dual-DB & History | Add `price_history` schema/collection; implement optimization logic in `src/db.js` and integrate with `src/scheduler.js`. | M1 | PLANNED |
-| 3 | Actions & Daemon | Configure `.github/workflows/scraper.yml` with Cron schedule and credentials. Verify local daemon mode. | M2 | PLANNED |
-| 4 | README & Documentation | Create clear setup instructions in `README.md` for Firebase CLI and secrets configuration. | M3 | PLANNED |
+| 1 | Git & Firebase Init | Initialize Git, create GitHub repository via `gh` CLI, create `.gitignore`, configure `firebase.json`, `.firebaserc`, and `firestore.rules`. | None | DONE |
+| 2 | Dual-DB & History | Add `price_history` schema/collection; implement optimization logic in `src/db.js` and integrate with `src/scheduler.js`. | M1 | DONE |
+| 3 | Actions & Daemon | Configure `.github/workflows/scraper.yml` with Cron schedule and credentials. Verify local daemon mode. | M2 | DONE |
+| 4 | README & Documentation | Create clear setup instructions in `README.md` for Firebase CLI and secrets configuration. | M3 | IN_PROGRESS (Conv: 069db06e-5504-4976-bdb7-9b5c60005a87) |
 | 5 | E2E & Local Verification | Verify full scraper runs, SQLite/Firestore sync, and exports work properly. | M4 | PLANNED |
 | 6 | Forensic Audit | Run Forensic Auditor to guarantee codebase integrity and absolute directory isolation. | M5 | PLANNED |
 

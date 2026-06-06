@@ -198,7 +198,9 @@ async function main() {
 }
 
 // Start Scraper
-main().catch(error => {
-  console.error('Scraper process exited with critical error:', error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(error => {
+    console.error('Scraper process exited with critical error:', error);
+    process.exit(1);
+  });
+}

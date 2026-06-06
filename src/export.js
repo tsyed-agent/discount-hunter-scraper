@@ -27,7 +27,7 @@ function escapeCsv(value) {
  * Exports data to CSV
  * @param {Array<Object>} lots - List of lots
  */
-function exportToCsv(lots) {
+function exportToCsv(lots, history) {
   const csvPath = path.join(exportDir, 'lots.csv');
   console.log(`Writing CSV export to ${csvPath}...`);
   
@@ -60,24 +60,50 @@ function exportToCsv(lots) {
 
   fs.writeFileSync(csvPath, rows.join('\n'), 'utf8');
   console.log(`CSV Export completed successfully. Total lines: ${rows.length}`);
+
+  // Export price history to CSV
+  const historyCsvPath = path.join(exportDir, 'price_history.csv');
+  console.log(`Writing price history CSV export to ${historyCsvPath}...`);
+  
+  const historyHeaders = ['History ID', 'Lot ID', 'Price', 'Bid Count', 'Timestamp'];
+  const historyRows = [historyHeaders.join(',')];
+
+  for (const entry of history) {
+    const row = [
+      escapeCsv(entry.historyId),
+      escapeCsv(entry.lotId),
+      entry.price !== undefined && entry.price !== null ? entry.price : '',
+      entry.bidCount !== undefined && entry.bidCount !== null ? entry.bidCount : '',
+      escapeCsv(entry.timestamp)
+    ];
+    historyRows.push(row.join(','));
+  }
+
+  fs.writeFileSync(historyCsvPath, historyRows.join('\n'), 'utf8');
+  console.log(`Price History CSV Export completed successfully. Total lines: ${historyRows.length}`);
 }
 
 /**
  * Exports data to JSON
  * @param {Array<Object>} lots - List of lots
  */
-function exportToJson(lots) {
+function exportToJson(lots, history) {
   const jsonPath = path.join(exportDir, 'lots.json');
   console.log(`Writing JSON export to ${jsonPath}...`);
   fs.writeFileSync(jsonPath, JSON.stringify(lots, null, 2), 'utf8');
-  console.log(`JSON Export completed successfully.`);
+  
+  const historyJsonPath = path.join(exportDir, 'price_history.json');
+  console.log(`Writing price history JSON export to ${historyJsonPath}...`);
+  fs.writeFileSync(historyJsonPath, JSON.stringify(history, null, 2), 'utf8');
+  
+  console.log(`JSON Exports completed successfully.`);
 }
 
 /**
  * Exports data to a local SQLite database file
  * @param {Array<Object>} lots - List of lots
  */
-function exportToSqlite(lots) {
+function exportToSqlite(lots, history) {
   const sqlitePath = path.join(exportDir, 'lots.db');
   console.log(`Writing SQLite copy to ${sqlitePath}...`);
   
@@ -107,14 +133,29 @@ function exportToSqlite(lots) {
     )
   `).run();
 
-  const insert = tempDb.prepare(`
+  tempDb.prepare(`
+    CREATE TABLE price_history (
+      history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lot_id TEXT,
+      price REAL,
+      bid_count INTEGER,
+      timestamp TEXT
+    )
+  `).run();
+
+  const insertLot = tempDb.prepare(`
     INSERT INTO lots (id, lot_number, title, description, current_price, min_bid, bid_count, status, end_time, images, url, last_updated, is_active)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const transaction = tempDb.transaction((lotsData) => {
+  const insertHistory = tempDb.prepare(`
+    INSERT INTO price_history (lot_id, price, bid_count, timestamp)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const transaction = tempDb.transaction((lotsData, historyData) => {
     for (const lot of lotsData) {
-      insert.run(
+      insertLot.run(
         lot.id,
         lot.lotNumber || null,
         lot.title || null,
@@ -130,9 +171,18 @@ function exportToSqlite(lots) {
         (lot.isActive !== false) ? 1 : 0
       );
     }
+
+    for (const entry of historyData) {
+      insertHistory.run(
+        entry.lotId,
+        entry.price !== undefined ? entry.price : null,
+        entry.bidCount !== undefined ? entry.bidCount : 0,
+        entry.timestamp || null
+      );
+    }
   });
 
-  transaction(lots);
+  transaction(lots, history);
   tempDb.close();
   console.log(`SQLite database export completed successfully.`);
 }
@@ -150,14 +200,23 @@ async function runExport() {
     process.exit(0);
   }
 
-  console.log(`Fetched ${lots.length} lots. Building export packages...`);
+  // Fetch price history
+  console.log('Fetching price history data from database...');
+  let history = [];
+  try {
+    history = await db.getPriceHistory();
+  } catch (err) {
+    console.warn('Could not fetch price history (maybe database not initialized):', err.message);
+  }
+
+  console.log(`Fetched ${lots.length} lots and ${history.length} history entries. Building export packages...`);
   
-  exportToJson(lots);
-  exportToCsv(lots);
+  exportToJson(lots, history);
+  exportToCsv(lots, history);
   
   // Only attempt SQLite copy if better-sqlite3 is installed (which it is in package.json)
   try {
-    exportToSqlite(lots);
+    exportToSqlite(lots, history);
   } catch (e) {
     console.error('Failed to write SQLite db copy:', e.message);
   }

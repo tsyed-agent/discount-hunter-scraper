@@ -45,27 +45,36 @@ Open your terminal in the project directory and run:
 npm install
 ```
 
-### 2. Set Up a Free Firebase Database
+### 2. Set Up a Free Firebase Database & Deploy Rules
 1. Go to the [Firebase Console](https://console.firebase.google.com/) and click **Create a Project** (select the free Spark Plan, no credit card needed).
 2. Once the project is created, click on **Build -> Firestore Database** in the left menu and click **Create Database**.
 3. Select your location and choose **Start in test mode** (or configure secure rules).
-4. Go to **Project Settings** (gear icon next to Project Overview) -> **Service Accounts**.
-5. Click **Generate New Private Key** to download a Service Account JSON file. 
-6. Keep this JSON file safe! Rename it to `firebase-key.json` and place it in your project folder (do not upload it to GitHub).
+4. Authenticate the Firebase CLI locally on your machine by running:
+   ```bash
+   npx firebase login
+   ```
+5. Deploy the preconfigured Firestore security rules to your Firebase project by running:
+   ```bash
+   npx firebase deploy --only firestore
+   ```
+6. Export the Firebase Service Account JSON key from the Firebase Console:
+   - Go to **Project Settings** (gear icon next to Project Overview) -> **Service Accounts**.
+   - Click **Generate New Private Key** to download a Service Account JSON file.
+7. Keep this JSON file safe! Rename it to `firebase-key.json` and place it in your project folder (do not upload it to GitHub as it is already added to `.gitignore`).
 
 ---
 
 ## How to Run the Scraper
 
 ### Mode A: Run in the Cloud (GitHub Actions - Recommended)
-This runs the scraper automatically on GitHub's servers every 3 hours for free.
+This runs the scraper automatically on GitHub's servers every hour for free.
 
 1. Create a GitHub repository and push your project files (the scraper workflow is located in `.github/workflows/scraper.yml`).
 2. Go to your GitHub repository -> **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
 3. Name the secret `FIREBASE_SERVICE_ACCOUNT`.
 4. Open the `firebase-key.json` file you downloaded from Firebase, copy its entire text contents, and paste it into the secret value. Click **Add secret**.
 5. **How it runs**:
-   - The scraper will automatically trigger every 3 hours.
+   - The scraper will automatically trigger every hour.
    - You can also run it manually at any time by going to the **Actions** tab in your GitHub repository, selecting the **Run HiBid Scraper** workflow, and clicking **Run workflow**.
 
 ### Mode B: Run Locally on Your Laptop (SQLite/Firestore)
