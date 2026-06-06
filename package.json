@@ -1,0 +1,31 @@
+{
+  "name": "discount-hunter-scraper",
+  "version": "1.0.0",
+  "description": "Lightweight, stealthy web scraper for weekly Discount Hunters auctions on HiBid.com",
+  "main": "src/scheduler.js",
+  "scripts": {
+    "start": "node src/scheduler.js",
+    "local": "cross-env NODE_ENV=local node src/scheduler.js",
+    "export": "node src/export.js"
+  },
+  "keywords": [
+    "scraper",
+    "hibid",
+    "playwright",
+    "stealth",
+    "sqlite",
+    "firebase"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "better-sqlite3": "^12.10.0",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.0.0",
+    "playwright": "^1.42.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

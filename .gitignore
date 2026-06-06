@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# SQLite files
+lots.db
+lots.db-journal
+lots.db-shm
+lots.db-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Firebase secrets/cache
+.firebase/
+firebase-key.json
+*.firebase-key.json
+*debug.log
+
+# Local environment configuration
+.env
+.env.*
+
+# Exports
+export_data/
+*.csv
+*.json
+!package.json
+!config.json
+!firebase.json
+!*.firebaserc
+
+# Agent workspaces
+.agents/
+
+# OS metadata
+.DS_Store
+Thumbs.db

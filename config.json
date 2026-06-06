@@ -1,0 +1,6 @@
+{
+  "auctionUrl": "https://discounthunters.hibid.com/catalog/747454/-408--returns-and-unclaimed",
+  "pricePollIntervalSeconds": 60,
+  "maxConcurrentRequests": 5,
+  "requestJitterMs": 200
+}
