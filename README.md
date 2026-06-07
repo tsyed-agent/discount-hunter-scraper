@@ -116,3 +116,9 @@ Every Sunday night or Monday morning when the new auction is posted:
 2. Open `config.json` in your repository.
 3. Paste the new URL into the `"auctionUrl"` field.
 4. Commit and push the `config.json` change to GitHub. The scraper will automatically detect the new URL and start tracking the new lots!
+
+---
+
+## Additional Documentation
+* **[Product Requirement Document (PRD)](PRD.md)**: Details the goals, system architecture, database schemas, and constraints.
+* **[Handoff Document](handoff.md)**: Contains operational workflows, codebase maps, and troubleshooting guidelines.
