@@ -1,8 +1,12 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // All reads and writes are performed exclusively by the Firebase Admin SDK
+    // (the scraper running server-side), which bypasses these rules entirely.
+    // Denying everything here ensures no client-side SDK — browser, mobile,
+    // or otherwise — can touch auction data even with valid Firebase credentials.
     match /{document=**} {
-      allow read, write: if request.auth != null;
+      allow read, write: if false;
     }
   }
 }

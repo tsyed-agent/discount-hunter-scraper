@@ -1,0 +1,26 @@
+name: Deploy Firestore Rules
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firestore.rules'   # only runs when rules file actually changes
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Firestore Security Rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy Firestore rules
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only firestore:rules
+        env:
+          # Generate this token once with: npx firebase-tools login:ci
+          # Then add it as a GitHub secret named FIREBASE_TOKEN
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
