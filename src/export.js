@@ -225,7 +225,10 @@ async function runExport() {
   process.exit(0);
 }
 
-runExport().catch(err => {
-  console.error('Critical export error:', err);
-  process.exit(1);
-});
+// Guard: only run when invoked directly (not when require()'d by other modules)
+if (require.main === module) {
+  runExport().catch(err => {
+    console.error('Critical export error:', err);
+    process.exit(1);
+  });
+}

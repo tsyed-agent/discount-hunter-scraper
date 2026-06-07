@@ -332,29 +332,39 @@ async function getPriceHistory() {
 }
 
 /**
- * Marks lots not in the active list as inactive
+ * Marks lots not in the active list as inactive.
+ * Firestore batches are capped at 400 ops per commit to stay well under
+ * the hard 500-operation limit.
  * @param {Array<string>} activeIds - List of active lot IDs from the current crawl
  */
 async function syncActiveStatus(activeIds) {
   if (activeIds.length === 0) return;
 
   if (dbType === 'firestore') {
-    // Batch updates for Firestore
-    const batch = firestoreDb.batch();
+    const BATCH_LIMIT = 400;
     const snapshot = await firestoreDb.collection('lots').where('isActive', '==', true).get();
-    
-    let count = 0;
+
+    // Collect refs to deactivate
+    const toDeactivate = [];
     snapshot.forEach(doc => {
       if (!activeIds.includes(doc.id)) {
-        batch.update(doc.ref, { isActive: false, status: 'Closed' });
-        count++;
+        toDeactivate.push(doc.ref);
       }
     });
 
-    if (count > 0) {
+    if (toDeactivate.length === 0) return;
+
+    // Commit in chunks of BATCH_LIMIT
+    for (let i = 0; i < toDeactivate.length; i += BATCH_LIMIT) {
+      const chunk = toDeactivate.slice(i, i + BATCH_LIMIT);
+      const batch = firestoreDb.batch();
+      for (const ref of chunk) {
+        batch.update(ref, { isActive: false, status: 'Closed' });
+      }
       await batch.commit();
-      console.log(`Deactivated ${count} stale lots in Firestore.`);
     }
+
+    console.log(`Deactivated ${toDeactivate.length} stale lots in Firestore.`);
   } else {
     // SQLite
     const placeholders = activeIds.map(() => '?').join(',');

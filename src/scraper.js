@@ -5,31 +5,36 @@ const stealth = require('puppeteer-extra-plugin-stealth')();
 // Inject stealth plugin to avoid anti-bot blocks
 chromium.use(stealth);
 
-// Global configuration variables for session
+// Session state — shared across all requests in this process
 let sessionCookies = '';
 let sessionHeaders = {};
 let targetUrlInfo = null;
+
+// Mutex: prevents concurrent handshakes. Multiple callers awaiting the same
+// handshake all share the single in-flight Promise, so only one browser
+// instance is ever launched at a time.
+let _handshakePromise = null;
 
 /**
  * Parses the HiBid Catalog URL to extract hostname, catalog ID, and slug.
  * Example URL: https://discounthunters.hibid.com/catalog/747454/-408--returns-and-unclaimed
  * @param {string} url - The catalog URL
- * @returns {Object} - Parsed info { host, catalogId, slug }
+ * @returns {Object} - { host, hostname, catalogId, slug }
  */
 function parseCatalogUrl(url) {
   try {
     const parsed = new URL(url);
-    const pathParts = parsed.pathname.split('/').filter(Boolean); // ['catalog', '747454', '-408--returns-and-unclaimed']
-    
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+
     if (pathParts[0] !== 'catalog' || !pathParts[1]) {
       throw new Error('Invalid HiBid catalog URL structure. Expected /catalog/[id]/[slug]');
     }
 
     return {
-      host: parsed.origin,          // "https://discounthunters.hibid.com"
-      hostname: parsed.hostname,    // "discounthunters.hibid.com"
-      catalogId: pathParts[1],      // "747454"
-      slug: pathParts[2] || ''      // "-408--returns-and-unclaimed"
+      host: parsed.origin,       // "https://discounthunters.hibid.com"
+      hostname: parsed.hostname, // "discounthunters.hibid.com"
+      catalogId: pathParts[1],   // "747454"
+      slug: pathParts[2] || ''   // "-408--returns-and-unclaimed"
     };
   } catch (error) {
     console.error('URL Parsing Error:', error.message);
@@ -40,9 +45,28 @@ function parseCatalogUrl(url) {
 /**
  * Runs a headless Playwright browser to visit the catalog page,
  * bypass Cloudflare, and extract session cookies/headers.
+ *
+ * Thread-safe: if multiple async callers invoke this simultaneously
+ * (e.g. concurrent page tasks all hitting SESSION_EXPIRED), only one
+ * Playwright browser is launched; all other callers await that single run.
+ *
  * @param {string} url - The catalog URL to visit
  */
 async function runHandshake(url) {
+  // If a handshake is already in flight, piggy-back on it
+  if (_handshakePromise) {
+    console.log('Handshake already in progress — waiting for it to complete...');
+    return _handshakePromise;
+  }
+
+  _handshakePromise = _doHandshake(url).finally(() => {
+    _handshakePromise = null;
+  });
+
+  return _handshakePromise;
+}
+
+async function _doHandshake(url) {
   console.log(`Starting Playwright stealth handshake for: ${url}`);
   targetUrlInfo = parseCatalogUrl(url);
 
@@ -59,12 +83,11 @@ async function runHandshake(url) {
 
   const page = await context.newPage();
 
-  // Setup response interception to capture API headers if any specific requests occur
+  // Intercept API requests to capture any custom auth headers
   page.on('request', request => {
     const reqUrl = request.url();
     if (reqUrl.includes('/api/') || reqUrl.includes('/catalog/')) {
       const headers = request.headers();
-      // Keep headers that look like Auth or custom headers for future requests
       if (headers['x-request-token'] || headers['x-xsrf-token'] || headers['requestverificationtoken']) {
         sessionHeaders = { ...sessionHeaders, ...headers };
       }
@@ -72,17 +95,12 @@ async function runHandshake(url) {
   });
 
   try {
-    // Go to catalog URL and wait for DOM load
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    
-    // Give it a brief moment to execute scripts/cookies
     await page.waitForTimeout(3000);
 
-    // Extract cookies
     const cookies = await context.cookies(url);
     sessionCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-    
-    // Build request headers
+
     sessionHeaders = {
       ...sessionHeaders,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -105,10 +123,11 @@ async function runHandshake(url) {
 }
 
 /**
- * Helper to fetch data via Axios with retries and backoff.
- * @param {string} url - Target URL to request
- * @param {number} retries - Number of retries
- * @param {number} delay - Initial delay in ms
+ * Helper to fetch data via Axios with exponential backoff + jitter.
+ * Throws SESSION_EXPIRED for 401/403 so the scheduler can renew.
+ * @param {string} url
+ * @param {number} retries
+ * @param {number} delay - initial delay in ms
  */
 async function fetchWithRetry(url, retries = 3, delay = 2000) {
   for (let i = 0; i < retries; i++) {
@@ -116,18 +135,15 @@ async function fetchWithRetry(url, retries = 3, delay = 2000) {
       const response = await axios.get(url, { headers: sessionHeaders, timeout: 15000 });
       return response;
     } catch (error) {
-      const isRateLimit = error.response && error.response.status === 429;
-      const isAuthError = error.response && (error.response.status === 401 || error.response.status === 403);
-      
-      console.warn(`Fetch attempt ${i + 1} failed for ${url}. Status: ${error.response?.status || error.message}`);
-      
-      if (isAuthError) {
-        throw new Error('SESSION_EXPIRED'); // Let the scheduler trigger a new handshake
+      const status = error.response?.status;
+      console.warn(`Fetch attempt ${i + 1} failed for ${url}. Status: ${status || error.message}`);
+
+      if (status === 401 || status === 403) {
+        throw new Error('SESSION_EXPIRED');
       }
 
       if (i === retries - 1) throw error;
-      
-      // Calculate delay with backoff + jitter
+
       const waitTime = delay * Math.pow(2, i) + Math.random() * 1000;
       console.log(`Waiting ${Math.round(waitTime)}ms before retry...`);
       await new Promise(resolve => setTimeout(resolve, waitTime));
@@ -136,198 +152,224 @@ async function fetchWithRetry(url, retries = 3, delay = 2000) {
 }
 
 /**
- * Fetches a single catalog page using direct HTTP requests.
- * Parses the HTML contents of the page for lot details.
- * @param {number} pageNumber - The page number to fetch (starts at 1)
- * @returns {Array<Object>} - List of lot objects parsed from the page
+ * Returns the total number of pages in the catalog by scanning page 1.
+ * Requires runHandshake() to have been called first.
+ * @returns {number}
  */
-async function fetchCatalogPage(pageNumber) {
+async function getTotalPages() {
   if (!targetUrlInfo) {
-    throw new Error('Scraper must be initialized with runHandshake() before fetching pages.');
+    throw new Error('Scraper must be initialized with runHandshake() before getTotalPages().');
   }
 
-  // Construct page URL
-  // HiBid uses query parameter apage=X for page numbering
-  const pageUrl = `${targetUrlInfo.host}/catalog/${targetUrlInfo.catalogId}/${targetUrlInfo.slug}?apage=${pageNumber}`;
-  console.log(`Fetching page ${pageNumber}...`);
-
-  const response = await fetchWithRetry(pageUrl);
-  return parsePageHtml(response.data, pageNumber);
-}
-
-/**
- * Parses the raw HTML content of a HiBid catalog page to extract lots.
- * Uses string parsing / regex to keep it lightweight and zero-dependency.
- * @param {string} html - Raw HTML string
- * @param {number} pageNumber - Current page number (for logs)
- * @returns {Array<Object>} - Parsed lot objects
- */
-function parsePageHtml(html, pageNumber) {
-  const lots = [];
-  
-  // We look for the JSON payload initialized on the page for listings.
-  // HiBid pages embed their items list in the HTML source code within a script tag,
-  // typically inside a window variable, or a JSON script block like:
-  // "eventItems": [...] or similar.
-  // Let's perform a regex lookup for JSON arrays that represent the items.
-  
-  let itemsData = null;
-
-  // Pattern 1: Look for "items": [ ... ] or similar serialized state in scripts
-  const itemsRegex = /"items"\s*:\s*(\[[^]*?\])\s*,\s*"pageNumber"/g;
-  const match = itemsRegex.exec(html);
-  
-  if (match && match[1]) {
-    try {
-      // Parse the JSON representation of items directly from the HTML scripts!
-      // This is extremely robust and avoids fragile HTML DOM selectors.
-      itemsData = JSON.parse(match[1]);
-    } catch (e) {
-      console.warn('JSON regex match failed to parse:', e.message);
-    }
-  }
-
-  // If script regex fails, we fall back to manual HTML parsing using regex for selectors
-  if (itemsData && Array.isArray(itemsData)) {
-    console.log(`Parsed ${itemsData.length} items from script JSON on page ${pageNumber}.`);
-    
-    for (const item of itemsData) {
-      lots.push({
-        id: String(item.id || item.lotId),
-        lotNumber: String(item.lotNumber || item.lotNum || ''),
-        title: item.title || item.name || '',
-        description: item.description || item.desc || '',
-        currentPrice: Number(item.currentBid || item.price || 0),
-        minBid: Number(item.nextBid || item.minimumBid || 0),
-        bidCount: Number(item.bidCount || item.numBids || 0),
-        status: item.status || (item.closed ? 'Closed' : 'Open'),
-        endTime: item.endTime || item.closes || null,
-        images: Array.isArray(item.images) ? item.images : (item.imageUrl ? [item.imageUrl] : []),
-        url: item.url ? `${targetUrlInfo.host}${item.url}` : `${targetUrlInfo.host}/lot/${item.id}`,
-        isActive: !item.closed
-      });
-    }
-  } else {
-    // Fallback: Parse via regular expression selector templates
-    // HiBid lists lots in standard divs, let's extract them by identifying key classes.
-    // Typical selectors:
-    // lot-title, lot-description, current-bid
-    console.log(`No direct JSON array found in page ${pageNumber} script tags. Using HTML regex parser...`);
-    
-    // Splitting by lot-tile containers (often class="lot-tile" or similar)
-    const lotTileRegex = /<div[^>]*class="[^"]*lot-tile[^"]*"[^]*?<\/div>\s*<\/div>/g;
-    let lotMatch;
-    
-    while ((lotMatch = lotTileRegex.exec(html)) !== null) {
-      const lotHtml = lotMatch[0];
-      
-      const idMatch = /id="lot-(\d+)"|data-lot-id="(\d+)"/i.exec(lotHtml);
-      const lotNumMatch = /class="lot-number"[^>]*>([^<]+)/i.exec(lotHtml);
-      const titleMatch = /class="lot-title"[^>]*>([^<]+)/i.exec(lotHtml);
-      const priceMatch = /class="current-bid"[^>]*>([^<]+)/i.exec(lotHtml);
-      
-      if (idMatch) {
-        const id = idMatch[1] || idMatch[2];
-        lots.push({
-          id,
-          lotNumber: lotNumMatch ? lotNumMatch[1].trim() : '',
-          title: titleMatch ? titleMatch[1].trim() : '',
-          description: '', // Desc is often truncated on main page, full sync handles this
-          currentPrice: priceMatch ? parseFloat(priceMatch[1].replace(/[^0-9.]/g, '')) || 0 : 0,
-          minBid: 0,
-          bidCount: 0,
-          status: 'Open',
-          endTime: null,
-          images: [],
-          url: `${targetUrlInfo.host}/lot/${id}`,
-          isActive: true
-        });
-      }
-    }
-  }
-
-  return lots;
-}
-
-/**
- * Fetches the pricing updates directly for all active lots.
- * In HiBid, dynamic price/bid updates are fetched via an internal endpoint
- * or by querying the first page. Let's design a quick-poll query.
- * @param {Array<string>} lotIds - List of active lot IDs to refresh
- * @returns {Array<Object>} - Updated lot price objects
- */
-async function fetchPricesOnly(lotIds) {
-  if (!targetUrlInfo) {
-    throw new Error('Scraper must be initialized with runHandshake() before fetching prices.');
-  }
-
-  // To fetch prices in near real-time, we can query HiBid's auction status updates API endpoint.
-  // HiBid uses a real-time status update endpoint for active auctions:
-  // https://discounthunters.hibid.com/api/v1/event/lots/status
-  // Let's construct a status query request.
-  
-  const statusApiUrl = `${targetUrlInfo.host}/api/v1/catalog/${targetUrlInfo.catalogId}/status`;
-  console.log(`Polling real-time prices from status API...`);
-
-  try {
-    const response = await fetchWithRetry(statusApiUrl);
-    
-    if (response.data && Array.isArray(response.data.statuses)) {
-      return response.data.statuses.map(item => ({
-        id: String(item.lotId || item.id),
-        currentPrice: Number(item.currentBid || item.price || 0),
-        minBid: Number(item.nextBid || item.minimumBid || 0),
-        bidCount: Number(item.bidCount || item.numBids || 0),
-        status: item.closed ? 'Closed' : 'Open'
-      }));
-    }
-  } catch (error) {
-    console.warn('Status API failed, falling back to scraping page 1 for quick update:', error.message);
-  }
-
-  // Fallback: If status endpoint is blocked or missing, scrape page 1 prices (often covers active/ending lots)
-  const p1Lots = await fetchCatalogPage(1);
-  return p1Lots.map(lot => ({
-    id: lot.id,
-    currentPrice: lot.currentPrice,
-    minBid: lot.minBid,
-    bidCount: lot.bidCount,
-    status: lot.status
-  }));
-}
-
-/**
- * Extract the total number of pages in the catalog by scanning the first page's HTML.
- * @param {string} url - The catalog URL
- * @returns {number} - Total pages count
- */
-async function getTotalPages(url) {
-  await runHandshake(url);
-  
   const pageUrl = `${targetUrlInfo.host}/catalog/${targetUrlInfo.catalogId}/${targetUrlInfo.slug}?apage=1`;
   const response = await fetchWithRetry(pageUrl);
   const html = response.data;
 
-  // Regex to look for pagination links / total page elements
-  // HiBid pagination often contains links like "?apage=75" or data-page-count="75"
-  const pageCountRegex = /apage=(\d+)/g;
+  // Find the highest ?apage=N value in pagination links
+  const pageCountRegex = /[?&]apage=(\d+)/g;
   let match;
   let maxPage = 1;
 
   while ((match = pageCountRegex.exec(html)) !== null) {
-    const pageNum = parseInt(match[1], 10);
-    if (pageNum > maxPage) {
-      maxPage = pageNum;
-    }
+    const n = parseInt(match[1], 10);
+    if (n > maxPage) maxPage = n;
+  }
+
+  // Also check data-page-count attributes (HiBid sometimes embeds this)
+  const dataPageMatch = /data-page-count="(\d+)"/i.exec(html);
+  if (dataPageMatch) {
+    const n = parseInt(dataPageMatch[1], 10);
+    if (n > maxPage) maxPage = n;
   }
 
   console.log(`Determined total pages from catalog: ${maxPage}`);
   return maxPage;
 }
 
+/**
+ * Fetches a single catalog page and returns parsed lot objects.
+ * Requires runHandshake() to have been called first.
+ * @param {number} pageNumber
+ * @returns {Array<Object>}
+ */
+async function fetchCatalogPage(pageNumber) {
+  if (!targetUrlInfo) {
+    throw new Error('Scraper must be initialized with runHandshake() before fetchCatalogPage().');
+  }
+
+  const pageUrl = `${targetUrlInfo.host}/catalog/${targetUrlInfo.catalogId}/${targetUrlInfo.slug}?apage=${pageNumber}`;
+  console.log(`Fetching catalog page ${pageNumber}...`);
+
+  const response = await fetchWithRetry(pageUrl);
+  return parsePageHtml(response.data, pageNumber);
+}
+
+/**
+ * Parses raw HTML from a HiBid catalog page into lot objects.
+ * Strategy 1: Extract embedded JSON state (fast, reliable when present).
+ * Strategy 2: Fall back to DOM regex parsing.
+ * @param {string} html
+ * @param {number} pageNumber
+ * @returns {Array<Object>}
+ */
+function parsePageHtml(html, pageNumber) {
+  const lots = [];
+
+  // --- Strategy 1: embedded JSON in script tags ---
+  // HiBid pages embed catalog data in JS variables like:
+  //   window.__NEXT_DATA__ = {...}  or  "items":[...], "pageNumber":N
+  let itemsData = null;
+
+  // Try window.__NEXT_DATA__ / React/Next.js SSR payload first (most reliable)
+  const nextDataMatch = /<script[^>]*id="__NEXT_DATA__"[^>]*>([^<]+)<\/script>/i.exec(html);
+  if (nextDataMatch) {
+    try {
+      const nextData = JSON.parse(nextDataMatch[1]);
+      // Walk common key paths for HiBid's Next.js structure
+      const props = nextData?.props?.pageProps;
+      const candidates = [
+        props?.items,
+        props?.lots,
+        props?.catalog?.items,
+        props?.initialState?.catalog?.items
+      ];
+      for (const c of candidates) {
+        if (Array.isArray(c) && c.length > 0) {
+          itemsData = c;
+          break;
+        }
+      }
+    } catch (e) {
+      // Not a Next.js page or parsing failed — continue to next strategy
+    }
+  }
+
+  // Try generic "items":[...] JSON blob in any script tag
+  if (!itemsData) {
+    const itemsRegex = /"items"\s*:\s*(\[[\s\S]*?\])\s*,\s*"pageNumber"/g;
+    const m = itemsRegex.exec(html);
+    if (m) {
+      try {
+        itemsData = JSON.parse(m[1]);
+      } catch (e) {
+        console.warn(`[Page ${pageNumber}] JSON "items" parse failed:`, e.message);
+      }
+    }
+  }
+
+  if (itemsData && Array.isArray(itemsData) && itemsData.length > 0) {
+    console.log(`[Page ${pageNumber}] Parsed ${itemsData.length} items from script JSON.`);
+    for (const item of itemsData) {
+      const id = String(item.id || item.lotId || item.lot_id || '');
+      if (!id) continue;
+      lots.push({
+        id,
+        lotNumber: String(item.lotNumber || item.lotNum || item.lot_number || ''),
+        title: item.title || item.name || '',
+        description: item.description || item.desc || '',
+        currentPrice: Number(item.currentBid || item.currentPrice || item.price || 0),
+        minBid: Number(item.nextBid || item.minimumBid || item.minBid || 0),
+        bidCount: Number(item.bidCount || item.numBids || item.bids || 0),
+        status: item.status || (item.closed ? 'Closed' : 'Open'),
+        endTime: item.endTime || item.closes || item.end_time || null,
+        images: Array.isArray(item.images) ? item.images
+          : (item.imageUrl ? [item.imageUrl] : (item.image ? [item.image] : [])),
+        url: item.url
+          ? (item.url.startsWith('http') ? item.url : `${targetUrlInfo.host}${item.url}`)
+          : `${targetUrlInfo.host}/lot/${id}`,
+        isActive: !item.closed
+      });
+    }
+    return lots;
+  }
+
+  // --- Strategy 2: DOM regex fallback ---
+  console.log(`[Page ${pageNumber}] No JSON found — using HTML regex fallback.`);
+
+  // HiBid lot tiles: <div class="lot-tile ..."> ... </div>
+  // Use a non-greedy split on each tile container
+  const tilePattern = /<div[^>]+class="[^"]*\blot-tile\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div[^>]+class="[^"]*\blot-tile|$)/gi;
+  let tileMatch;
+
+  while ((tileMatch = tilePattern.exec(html)) !== null) {
+    const tile = tileMatch[0];
+
+    const idMatch = /(?:id="lot-(\d+)"|data-lot-id="(\d+)")/i.exec(tile);
+    if (!idMatch) continue;
+
+    const id = idMatch[1] || idMatch[2];
+    const lotNumMatch = /class="[^"]*lot-number[^"]*"[^>]*>\s*([^<]+)/i.exec(tile);
+    const titleMatch = /class="[^"]*lot-title[^"]*"[^>]*>\s*([^<]+)/i.exec(tile);
+    const priceMatch = /class="[^"]*current-bid[^"]*"[^>]*>\s*([^<]+)/i.exec(tile);
+    const bidCountMatch = /class="[^"]*bid-count[^"]*"[^>]*>\s*([^<]+)/i.exec(tile);
+    const imgMatch = /<img[^>]+src="([^"]+)"/i.exec(tile);
+
+    lots.push({
+      id,
+      lotNumber: lotNumMatch ? lotNumMatch[1].trim() : '',
+      title: titleMatch ? titleMatch[1].trim() : '',
+      description: '',
+      currentPrice: priceMatch ? parseFloat(priceMatch[1].replace(/[^0-9.]/g, '')) || 0 : 0,
+      minBid: 0,
+      bidCount: bidCountMatch ? parseInt(bidCountMatch[1].replace(/\D/g, ''), 10) || 0 : 0,
+      status: 'Open',
+      endTime: null,
+      images: imgMatch ? [imgMatch[1]] : [],
+      url: `${targetUrlInfo.host}/lot/${id}`,
+      isActive: true
+    });
+  }
+
+  if (lots.length === 0) {
+    console.warn(`[Page ${pageNumber}] Zero lots parsed — HiBid page structure may have changed.`);
+  }
+
+  return lots;
+}
+
+/**
+ * Attempts to fetch current prices for all lots via HiBid's status API.
+ * This is the fast path for price polls — avoids re-scraping every page.
+ *
+ * Throws if the API is unavailable so the caller can fall back to page scanning.
+ * Requires runHandshake() to have been called first.
+ *
+ * @returns {Array<Object>} - Array of { id, currentPrice, minBid, bidCount, status }
+ */
+async function tryFetchPricesFromApi() {
+  if (!targetUrlInfo) {
+    throw new Error('Scraper must be initialized with runHandshake() before tryFetchPricesFromApi().');
+  }
+
+  // HiBid real-time status endpoint (best known candidate).
+  // Throws SESSION_EXPIRED or a generic error if unavailable.
+  const statusApiUrl = `${targetUrlInfo.host}/api/v1/catalog/${targetUrlInfo.catalogId}/status`;
+  console.log(`[Price Poll] Trying status API: ${statusApiUrl}`);
+
+  const response = await fetchWithRetry(statusApiUrl);
+
+  // Expect { statuses: [...] } or a top-level array
+  const data = response.data;
+  const statuses = Array.isArray(data) ? data : data?.statuses;
+
+  if (!Array.isArray(statuses) || statuses.length === 0) {
+    throw new Error('Status API returned no usable data');
+  }
+
+  console.log(`[Price Poll] Status API returned ${statuses.length} lot updates.`);
+
+  return statuses.map(item => ({
+    id: String(item.lotId || item.id || item.lot_id || ''),
+    currentPrice: Number(item.currentBid || item.price || item.currentPrice || 0),
+    minBid: Number(item.nextBid || item.minimumBid || item.minBid || 0),
+    bidCount: Number(item.bidCount || item.numBids || item.bids || 0),
+    status: item.closed ? 'Closed' : 'Open'
+  })).filter(u => u.id);
+}
+
 module.exports = {
   runHandshake,
+  getTotalPages,
   fetchCatalogPage,
-  fetchPricesOnly,
-  getTotalPages
+  tryFetchPricesFromApi
 };

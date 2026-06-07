@@ -1,15 +1,22 @@
-name: Run HiBid Scraper
+name: Price Poll (Hourly)
 
 on:
   schedule:
-    # Run hourly
+    # Every hour — updates currentPrice, minBid, bidCount for all active lots.
+    # Fast path: tries HiBid status API first; falls back to full page scan.
     - cron: '0 * * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'manual'
 
 jobs:
-  scrape:
+  price-poll:
+    name: Price Poll
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,11 +30,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Playwright Chromium and System Dependencies
+      - name: Install Playwright Chromium and system dependencies
         run: npx playwright install --with-deps chromium
 
-      - name: Run Scraper
+      - name: Run price poll
         env:
-          # Firebase service account credential stored as a GitHub Repository Secret
+          SYNC_MODE: price
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: node src/scheduler.js

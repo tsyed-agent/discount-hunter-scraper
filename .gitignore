@@ -26,6 +26,7 @@ export_data/
 *.csv
 *.json
 !package.json
+!package-lock.json
 !config.json
 !firebase.json
 !*.firebaserc
