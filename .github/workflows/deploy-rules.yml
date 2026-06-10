@@ -21,6 +21,7 @@ jobs:
         with:
           args: deploy --only firestore:rules
         env:
-          # Generate this token once with: npx firebase-tools login:ci
-          # Then add it as a GitHub secret named FIREBASE_TOKEN
-          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          # Same service account used by the scraper workflows.
+          # In Firebase Console → Project Settings → Service Accounts →
+          # "Generate new private key" → copy the full JSON as this secret.
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
