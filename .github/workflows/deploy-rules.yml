@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'firestore.rules'   # only runs when rules file actually changes
+      - 'firestore.rules'
   workflow_dispatch:
 
 jobs:
@@ -16,12 +16,70 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy Firestore rules
-        uses: w9jds/firebase-action@master
-        with:
-          args: deploy --only firestore:rules
+      - name: Deploy rules via Firebase Rules API
         env:
-          # Same service account used by the scraper workflows.
-          # In Firebase Console → Project Settings → Service Accounts →
-          # "Generate new private key" → copy the full JSON as this secret.
-          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          node - << 'SCRIPT'
+          const crypto = require('crypto');
+          const https = require('https');
+          const fs = require('fs');
+
+          const creds = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+          const rules = fs.readFileSync('firestore.rules', 'utf8');
+
+          function b64url(s) { return Buffer.from(s).toString('base64url'); }
+
+          function getToken() {
+            const now = Math.floor(Date.now()/1000);
+            const header = b64url(JSON.stringify({alg:'RS256',typ:'JWT'}));
+            const payload = b64url(JSON.stringify({
+              iss: creds.client_email, sub: creds.client_email,
+              aud: 'https://oauth2.googleapis.com/token',
+              iat: now, exp: now+3600,
+              scope: 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/firebase'
+            }));
+            const sig = crypto.createSign('RSA-SHA256').update(`${header}.${payload}`).sign(creds.private_key);
+            const jwt = `${header}.${payload}.${sig.toString('base64url')}`;
+            return new Promise((res, rej) => {
+              const body = `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`;
+              const req = https.request({hostname:'oauth2.googleapis.com',path:'/token',method:'POST',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'}}, r => {
+                let d=''; r.on('data',c=>d+=c); r.on('end',()=>res(JSON.parse(d).access_token));
+              });
+              req.on('error',rej); req.write(body); req.end();
+            });
+          }
+
+          function api(method, path, token, body) {
+            return new Promise((res, rej) => {
+              const data = body ? JSON.stringify(body) : null;
+              const req = https.request({
+                hostname:'firebaserules.googleapis.com', path, method,
+                headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json',
+                  ...(data?{'Content-Length':Buffer.byteLength(data)}:{})}
+              }, r => {
+                let d=''; r.on('data',c=>d+=c); r.on('end',()=>res({status:r.statusCode,body:JSON.parse(d)}));
+              });
+              req.on('error',rej); if(data) req.write(data); req.end();
+            });
+          }
+
+          async function main() {
+            const token = await getToken();
+            const project = creds.project_id;
+
+            const rs = await api('POST', `/v1/projects/${project}/rulesets`, token, {
+              source: { files: [{ name: 'firestore.rules', content: rules }] }
+            });
+            if (rs.status !== 200) { console.error('Ruleset creation failed:', rs.body); process.exit(1); }
+            console.log('Ruleset created:', rs.body.name);
+
+            const rel = await api('PATCH', `/v1/projects/${project}/releases/cloud.firestore`, token, {
+              release: { name: `projects/${project}/releases/cloud.firestore`, rulesetName: rs.body.name }
+            });
+            if (rel.status !== 200) { console.error('Release update failed:', rel.body); process.exit(1); }
+            console.log('Firestore rules deployed successfully.');
+          }
+          main().catch(e => { console.error(e); process.exit(1); });
+          SCRIPT
