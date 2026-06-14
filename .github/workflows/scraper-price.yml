@@ -1,10 +1,16 @@
-name: Price Poll (Hourly)
+name: Price Poll
 
 on:
   schedule:
-    # Every hour — updates currentPrice, minBid, bidCount for all active lots.
-    # Fast path: tries HiBid status API first; falls back to full page scan.
-    - cron: '0 * * * *'
+    # Every 4 hours — updates currentPrice, minBid, bidCount, and status for all
+    # lots via HiBid's GraphQL API.
+    #
+    # Quota note: change-detection reads every lot once per run. A large catalog
+    # (this auctioneer routinely lists 5,000+ lots) polled hourly would exceed
+    # the Firestore Spark free tier (50,000 reads/day). Every 4 hours keeps a
+    # 5k-lot catalog at ~30k reads/day. Tighten the cron only if your catalog is
+    # small or you are on a paid Firestore plan.
+    - cron: '0 */4 * * *'
   workflow_dispatch:
     inputs:
       reason:
