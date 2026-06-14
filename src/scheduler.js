@@ -3,109 +3,78 @@ const config = require('../config.json');
 const db = require('./db');
 const scraper = require('./scraper');
 
-const JITTER_MS = config.requestJitterMs || 200;
-const CONCURRENCY_LIMIT = config.maxConcurrentRequests || 5;
+const PAGE_LENGTH = config.pageLength || 100;
+const INTER_PAGE_DELAY_MS = config.interPageDelayMs != null ? config.interPageDelayMs : 250;
 
 // Sleep helper
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * Runs an array of async task-factories concurrently, capped at `limit`
- * in-flight at a time. Uses a Set + .finally() so that failed tasks are
- * always removed from the tracking set (prevents stall after errors).
- *
- * Returns Promise.allSettled so one failed page never aborts the whole crawl.
- *
- * @param {Array<() => Promise>} tasks
- * @param {number} limit
- */
-async function runBatched(tasks, limit) {
-  const results = [];
-  const executing = new Set();
-
-  for (const task of tasks) {
-    const p = (async () => task())();
-    results.push(p);
-
-    if (tasks.length > limit) {
-      // Track in-flight count; clean up on both resolve and reject
-      const e = p.finally(() => executing.delete(e));
-      executing.add(e);
-
-      if (executing.size >= limit) {
-        await Promise.race(executing);
-      }
-    }
-  }
-
-  return Promise.allSettled(results);
-}
-
 // ---------------------------------------------------------------------------
-// Core crawl helper — shared by full sync and price-poll fallback
+// Core crawl helper — shared by full sync and price poll
 // ---------------------------------------------------------------------------
 
 /**
- * Crawls every page of the catalog concurrently.
- * Assumes runHandshake() has already been called (session is active).
+ * Pages through the entire auction catalog via HiBid's GraphQL API and saves
+ * every lot. Assumes runHandshake() has already been called.
  *
  * @param {boolean} isFullSync
  *   true  → upserts all fields (title, images, description, prices …)
- *   false → updates price/bid fields only (skips static fields in DB)
- * @returns {Array<string>} allActiveIds  (populated only when isFullSync=true)
+ *   false → updates price/bid/status fields only (skips static fields)
+ * @returns {{ activeIds: Array<string>, totalSaved: number, totalCount: number }}
  */
 async function crawlAllPages(isFullSync) {
-  const label = isFullSync ? 'Full Crawl' : 'Price Scan';
+  const label = isFullSync ? 'Full Crawl' : 'Price Poll';
 
-  let totalPages;
-  try {
-    totalPages = await scraper.getTotalPages();
-  } catch (err) {
-    console.error(`[${label}] Failed to determine page count:`, err.message);
-    throw err;
+  const activeIds = [];
+  let pageNumber = 1;
+  let totalCount = null;
+  let totalSaved = 0;
+
+  while (true) {
+    let pageResult;
+    try {
+      pageResult = await scraper.fetchLotPage(pageNumber, PAGE_LENGTH);
+    } catch (err) {
+      if (err.message === 'SESSION_EXPIRED') {
+        console.warn(`[${label}] Session expired on page ${pageNumber} — renewing handshake…`);
+        await scraper.closeSession();
+        await scraper.runHandshake(config.auctionUrl);
+        pageResult = await scraper.fetchLotPage(pageNumber, PAGE_LENGTH);
+      } else {
+        throw err;
+      }
+    }
+
+    const { lots, totalCount: tc } = pageResult;
+    if (totalCount === null) {
+      totalCount = tc;
+      const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_LENGTH));
+      console.log(`[${label}] Catalog reports ${totalCount} lot(s) across ~${totalPages} page(s).`);
+    }
+
+    if (lots.length === 0) break;
+
+    for (const lot of lots) {
+      await db.saveLot(lot, isFullSync);
+      if (isFullSync) activeIds.push(lot.id);
+      totalSaved++;
+    }
+    console.log(`[${label}] Page ${pageNumber}: saved ${lots.length} lot(s) (${totalSaved}/${totalCount}).`);
+
+    if (totalSaved >= totalCount) break;
+    pageNumber++;
+
+    // Safety valve so a misbehaving API can never loop forever.
+    if (pageNumber > 1000) {
+      console.warn(`[${label}] Page limit (1000) reached — stopping.`);
+      break;
+    }
+
+    if (INTER_PAGE_DELAY_MS > 0) await sleep(INTER_PAGE_DELAY_MS);
   }
 
-  console.log(`[${label}] Crawling ${totalPages} page(s) with concurrency=${CONCURRENCY_LIMIT}.`);
-
-  const allActiveIds = [];
-
-  const pageTasks = Array.from({ length: totalPages }, (_, i) => {
-    const page = i + 1;
-    return async () => {
-      // Small random jitter so bursts look organic
-      await sleep(Math.random() * JITTER_MS);
-
-      let lots;
-      try {
-        lots = await scraper.fetchCatalogPage(page);
-      } catch (err) {
-        if (err.message === 'SESSION_EXPIRED') {
-          console.warn(`[${label}] Session expired on page ${page} — renewing handshake…`);
-          try {
-            await scraper.runHandshake(config.auctionUrl);
-            lots = await scraper.fetchCatalogPage(page);
-          } catch (retryErr) {
-            console.error(`[${label}] Page ${page} failed after session renewal:`, retryErr.message);
-            return; // skip this page — don't crash the whole crawl
-          }
-        } else {
-          console.error(`[${label}] Page ${page} error:`, err.message);
-          return;
-        }
-      }
-
-      console.log(`[${label}] Page ${page}: ${lots.length} lots.`);
-
-      for (const lot of lots) {
-        await db.saveLot(lot, isFullSync);
-        if (isFullSync) allActiveIds.push(lot.id);
-      }
-    };
-  });
-
-  await runBatched(pageTasks, CONCURRENCY_LIMIT);
-  console.log(`[${label}] Page scan complete.`);
-  return allActiveIds;
+  console.log(`[${label}] Crawl complete — ${totalSaved} lot(s) processed.`);
+  return { activeIds, totalSaved, totalCount: totalCount || 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -114,56 +83,47 @@ async function crawlAllPages(isFullSync) {
 
 /**
  * Full sync: scrapes all catalog pages and upserts every field for every lot.
- * Also marks lots that disappeared from the catalog as inactive.
- * Should run once per day (or on manual trigger).
+ * Marks lots that disappeared from the catalog as inactive.
+ *
+ * Throws if zero lots were captured — this surfaces a broken scrape instead of
+ * silently reporting success (e.g. expired auction URL or changed API).
  */
 async function performFullCrawl() {
   console.log(`[Full Crawl] Starting — ${config.auctionUrl}`);
 
   await scraper.runHandshake(config.auctionUrl);
-  const allActiveIds = await crawlAllPages(true);
+  const { activeIds, totalSaved } = await crawlAllPages(true);
 
-  console.log(`[Full Crawl] Syncing active status for ${allActiveIds.length} lots…`);
-  await db.syncActiveStatus(allActiveIds);
+  if (totalSaved === 0) {
+    throw new Error(
+      'Full crawl captured 0 lots. The auction URL may be expired/invalid or HiBid changed its API. ' +
+      'Update config.json "auctionUrl" to the current auction.'
+    );
+  }
 
-  console.log(`[Full Crawl] Complete. ${allActiveIds.length} active lots.`);
-  return allActiveIds;
+  console.log(`[Full Crawl] Syncing active status for ${activeIds.length} lots…`);
+  await db.syncActiveStatus(activeIds);
+
+  console.log(`[Full Crawl] Complete. ${activeIds.length} active lots.`);
+  return activeIds;
 }
 
 /**
  * Price poll: updates currentPrice, minBid, bidCount, and status for every lot.
- * Static fields (title, images, description) are left untouched.
- *
- * Strategy 1 — fast path: hit HiBid's status API (single HTTP call for all lots).
- * Strategy 2 — page-scan fallback: re-crawl all pages with isFullSync=false.
- *   This is safe for catalogs of any size since it uses the same concurrency
- *   pool and change-detection logic as the full crawl.
+ * Static fields (title, images, description) are left untouched. A new
+ * price_history record is written only when price or bid count changed.
  */
 async function performPricePoll() {
   console.log('[Price Poll] Starting…');
 
   await scraper.runHandshake(config.auctionUrl);
+  const { totalSaved } = await crawlAllPages(false);
 
-  // --- Strategy 1: single-shot API ---
-  try {
-    const updates = await scraper.tryFetchPricesFromApi();
-    let saved = 0;
-    for (const update of updates) {
-      if (update.id) {
-        await db.saveLot(update, false);
-        saved++;
-      }
-    }
-    console.log(`[Price Poll] API path complete — ${saved} lots updated.`);
-    return;
-  } catch (apiErr) {
-    // 404, empty response, or status API not available for this account
-    console.warn('[Price Poll] Status API unavailable, falling back to page scan:', apiErr.message);
+  if (totalSaved === 0) {
+    throw new Error('Price poll captured 0 lots. The auction URL may be expired/invalid.');
   }
 
-  // --- Strategy 2: paginated fallback (handles any catalog size) ---
-  await crawlAllPages(false);
-  console.log('[Price Poll] Page-scan path complete.');
+  console.log('[Price Poll] Complete.');
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +139,7 @@ async function main() {
     // -----------------------------------------------------------------------
     // Single-run mode (GitHub Actions)
     // SYNC_MODE=full  → full catalog crawl  (run daily)
-    // SYNC_MODE=price → price poll only      (run hourly)
+    // SYNC_MODE=price → price poll only      (run on a coarser schedule)
     // -----------------------------------------------------------------------
     const syncMode = (process.env.SYNC_MODE || 'full').toLowerCase();
     console.log(`Running in Single-Run Mode — SYNC_MODE=${syncMode}`);
@@ -191,9 +151,11 @@ async function main() {
         await performFullCrawl();
       }
       console.log('Single sync run completed successfully.');
+      await scraper.closeSession();
       process.exit(0);
     } catch (error) {
-      console.error('Critical scraper error during single run:', error);
+      console.error('Critical scraper error during single run:', error.message);
+      await scraper.closeSession();
       process.exit(1);
     }
   } else {
@@ -201,6 +163,7 @@ async function main() {
     // Daemon mode (local: npm run local)
     // Initial full crawl → then alternates between price polls (every
     // pricePollIntervalSeconds) and periodic full re-crawls (every 3 h).
+    // The browser session is kept open and reused across cycles.
     // -----------------------------------------------------------------------
     console.log('Running in Daemon Mode…');
 
@@ -237,8 +200,11 @@ async function main() {
 
 // Guard: only auto-start when invoked directly (not when require()'d by tests)
 if (require.main === module) {
-  main().catch(error => {
+  main().catch(async error => {
     console.error('Scraper process exited with critical error:', error);
+    await scraper.closeSession();
     process.exit(1);
   });
 }
+
+module.exports = { performFullCrawl, performPricePoll };

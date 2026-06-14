@@ -10,7 +10,7 @@ It runs automatically in the cloud via **GitHub Actions** and saves all lot list
 
 * 🚀 **100% Free Hosting**: Zero runtime cost and zero risk of unexpected billing.
 * 🛡️ **Anti-Bot Bypass**: Uses `playwright-extra` + `puppeteer-extra-plugin-stealth` to bypass Cloudflare security.
-* 📦 **Lightweight Direct Fetching**: Uses a single browser page to negotiate the handshake, then scrapes remaining pages using high-speed direct API calls (saving 95% bandwidth).
+* 📦 **GraphQL-Based Fetching**: Negotiates the Cloudflare handshake with one stealth browser page, then pulls the entire catalog directly from HiBid's GraphQL API (clean, structured JSON — no fragile HTML parsing).
 * 🔄 **Smart Dual-Sync Cycles**: 
   - **Full Sync**: Crawls all pages to parse descriptions, titles, and images.
   - **Price Sync**: Polls only current bids/prices on a fast loop.
@@ -23,10 +23,12 @@ It runs automatically in the cloud via **GitHub Actions** and saves all lot list
 ```text
 ├── .github/
 │   └── workflows/
-│       └── scraper.yml     # GitHub Actions hourly schedule configuration
+│       ├── scraper-full.yml   # Daily full catalog crawl (02:00 UTC)
+│       ├── scraper-price.yml  # Price poll every 4 hours
+│       └── deploy-rules.yml   # Deploys Firestore rules on change
 ├── src/
 │   ├── db.js               # Database adapter (Firestore & SQLite support)
-│   ├── scraper.js          # Playwright stealth & HTML parser
+│   ├── scraper.js          # Playwright stealth handshake + HiBid GraphQL fetcher
 │   ├── scheduler.js        # Single-run & local daemon orchestrator
 │   ├── export.js           # Cloud data downloader & exporter
 │   └── test-local.js       # Local syntax and module validator
@@ -67,15 +69,20 @@ npm install
 ## How to Run the Scraper
 
 ### Mode A: Run in the Cloud (GitHub Actions - Recommended)
-This runs the scraper automatically on GitHub's servers every hour for free.
+This runs the scraper automatically on GitHub's servers for free.
 
-1. Create a GitHub repository and push your project files (the scraper workflow is located in `.github/workflows/scraper.yml`).
+1. Create a GitHub repository and push your project files. Two scheduled workflows live in `.github/workflows/`:
+   - `scraper-full.yml` — a **full catalog crawl** once per day (02:00 UTC) that captures every field (title, description, images, prices) and marks ended lots as `Closed`.
+   - `scraper-price.yml` — a lighter **price poll** every 4 hours that refreshes current bid, next minimum bid, bid count, and status.
 2. Go to your GitHub repository -> **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
 3. Name the secret `FIREBASE_SERVICE_ACCOUNT`.
 4. Open the `firebase-key.json` file you downloaded from Firebase, copy its entire text contents, and paste it into the secret value. Click **Add secret**.
 5. **How it runs**:
-   - The scraper will automatically trigger every hour.
-   - You can also run it manually at any time by going to the **Actions** tab in your GitHub repository, selecting the **Run HiBid Scraper** workflow, and clicking **Run workflow**.
+   - The two workflows trigger automatically on their schedules.
+   - You can also run either one manually from the **Actions** tab by selecting the workflow and clicking **Run workflow**.
+   - Note: GitHub's scheduled runs are best-effort and can be delayed or skipped during peak load, so exact interval timing is not guaranteed.
+
+> **Free-tier quota note:** This auctioneer's weekly catalogs can contain 5,000+ lots. Because change-detection reads each lot once per run, polling too frequently can exceed Firestore's free Spark tier (50,000 reads/day). The default 4-hour price poll keeps a 5,000-lot catalog around ~30,000 reads/day. Increase the interval for larger catalogs, or decrease it only if your catalog is small or you are on a paid plan.
 
 ### Mode B: Run Locally on Your Laptop (SQLite/Firestore)
 If you want to run the scraper directly on your machine:
