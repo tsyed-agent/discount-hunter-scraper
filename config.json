@@ -1,6 +1,6 @@
 {
-  "auctionUrl": "https://discounthunters.hibid.com/catalog/747454/-408--returns-and-unclaimed",
+  "auctionUrl": "https://discounthunters.hibid.com/catalog/749490/-410--returns-and-unclaimed-packages",
   "pricePollIntervalSeconds": 60,
-  "maxConcurrentRequests": 5,
-  "requestJitterMs": 200
+  "pageLength": 100,
+  "interPageDelayMs": 250
 }
